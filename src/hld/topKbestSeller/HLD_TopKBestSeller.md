@@ -16,15 +16,15 @@ Present in this order:
 
 ### 1.1 Real-World Manifestations
 
-| System | Items | Score Signal | K | Freshness |
-|---|---|---|---|---|
-| Amazon Bestsellers | Products | Units sold in last 24h | 100 | Hourly update |
-| Apple App Store | Apps | Downloads in last 7 days | 200 | Daily update |
-| Twitter Trending | Hashtags | Tweet frequency (last 24h) | 10 | Near real-time (minutes) |
-| YouTube Trending | Videos | Views + likes + comments composite | 50 | Hourly update |
-| Google Search Trends | Queries | Search frequency | 20 | Near real-time |
-| Flipkart Flash Sale | Products | Units sold in last 1h | 50 | Every 5 min |
-| News Trending | Articles | Shares + views in last 1h | 10 | Every 5 min |
+| System               | Items    | Score Signal                       | K   | Freshness                |
+| -------------------- | -------- | ---------------------------------- | --- | ------------------------ |
+| Amazon Bestsellers   | Products | Units sold in last 24h             | 100 | Hourly update            |
+| Apple App Store      | Apps     | Downloads in last 7 days           | 200 | Daily update             |
+| Twitter Trending     | Hashtags | Tweet frequency (last 24h)         | 10  | Near real-time (minutes) |
+| YouTube Trending     | Videos   | Views + likes + comments composite | 50  | Hourly update            |
+| Google Search Trends | Queries  | Search frequency                   | 20  | Near real-time           |
+| Flipkart Flash Sale  | Products | Units sold in last 1h              | 50  | Every 5 min              |
+| News Trending        | Articles | Shares + views in last 1h          | 10  | Every 5 min              |
 
 ### 1.2 Dimensions Of The Problem
 
@@ -72,26 +72,461 @@ Three key design axes to clarify in interview:
 
 ## 3. Back-Of-The-Envelope Capacity Planning
 
+This section is the most important framing step in the interview. Every number in the
+architecture flows from these estimates. Work through each layer explicitly.
+
+---
+
+### 3.1 Clarify Scale Assumptions First
+
+Before calculating, state the assumptions clearly:
+
+| Parameter                       | Value                           | Justification                                                                            |
+| ------------------------------- | ------------------------------- | ---------------------------------------------------------------------------------------- |
+| Total items in catalog          | 500 million                     | Amazon's full SKU count                                                                  |
+| Active items (event in last 7d) | 10 million                      | ~2% of catalog drives 90% of sales                                                       |
+| Peak write throughput           | 1,000,000 events/sec            | Amazon Prime Day / App Store new launch surge                                            |
+| Sustained write throughput      | 100,000 events/sec              | Normal day average                                                                       |
+| Read throughput                 | 100,000 reads/sec               | Homepage + store front page loads                                                        |
+| Top-K value (K)                 | 100 (global) + 100 per category | Common display limit                                                                     |
+| Categories                      | 100                             | Broad categories like Electronics, Books, etc.                                           |
+| Time windows                    | 1h, 24h, 7d                     | Three concurrent sliding windows                                                         |
+| Event payload size              | 64 bytes                        | item_id (16B) + category (8B) + quantity (4B) + timestamp (8B) + user_id (16B) + padding |
+| Freshness SLO                   | 60 seconds                      | Top-K list updated within 1 minute of sales event                                        |
+
+### 3.1.1  “Write operations” usually include things like: 1M/s during flash sale or prime day
+* placing orders
+* adding items to cart
+* updating inventory
+* writing payment records
+* logging user activity
+* publishing events to queues like Apache Kafka
+
 ```
-Events:
-  1M events/sec × 64 bytes/event = 64 MB/s ingest bandwidth.
-  Per hour: 64 MB/s × 3600 = ~230 GB raw events.
-  Per day: ~5.5 TB raw events.
-
-Counts store:
-  500M items × 8 bytes (item_id) × 8 bytes (count) = ~8 GB for all counters.
-  With category breakdown (100 categories): 8 GB × 100 = 800 GB — too large for Redis.
-  Solution: Only track items with meaningful activity (< 10M active items at any time).
-  10M active items × 100 bytes (id + count + metadata ref) ≈ 1 GB → feasible in Redis.
-
-Top-K store:
-  K=100 per category (100 categories) + global K=100:
-  101 × 100 × ~200 bytes = 2 MB → trivially small; can live in Redis and be fully cached in CDN.
-
-Kafka:
-  1M events/sec × 64 bytes = 64 MB/s → 100 Kafka partitions × 640 KB/s each.
-  Retention: 48 hours (replay buffer).
+**Total users hitting the page:  ~10 million/sec   (at Amazon Prime Day scale)
+           ↓
+[CDN Cache — 99%+ cache hit]
+           ↓
+Requests reaching origin: ~100K/sec
+Hence, read throughtput is only 100k reads/s
 ```
+
+        ByteBuffer buffer = ByteBuffer.allocate(96);
+
+        buffer.put(UUID.fromString("a3f9c8d2-91b3-4f0c-a1b2-99e81234abcd")
+                .toString().getBytes()); // 36B
+
+        buffer.put("ELECTRON".getBytes()); // 8B
+
+        buffer.putInt(2); // quantity //4B
+
+        buffer.putLong(1710000000000L); // timestamp = 8B
+
+        buffer.put(UUID.fromString("5bd19c00-7b7f-4d0b-88a7-3cba11ef4321")
+                .toString().getBytes()); // 36B
+
+        buffer.putInt(0); // padding //4B
+---
+
+### 3.2 Event Ingest Volume
+
+**This is the write side — how much data flows into the system.**
+
+```
+Sustained ingest:
+  100,000 events/sec × 64 bytes = 6.4 MB/s incoming bandwidth.
+
+Peak ingest (Prime Day / sale event):
+  1,000,000 events/sec × 64 bytes = 64 MB/s incoming bandwidth.
+
+Per hour (peak):
+  64 MB/s × 3600 s = 230,400 MB ≈ 230 GB of raw events.
+
+Per day (peak):
+  230 GB × 24 hours = ~5.5 TB raw events per day.
+
+Per day (sustained average — assume 6h peak + 18h normal):
+  Sustained: 6.4 MB/s × 18h × 3600 = ~415 GB
+  Peak:      64 MB/s × 6h × 3600   = ~1,382 GB
+  Total avg day: ~1.8 TB raw events.
+
+WHY this matters:
+  → You can't store raw events in a DB and query them for Top-K. Even 1.8 TB/day
+    after 7 days = 12.6 TB of raw events to scan for the "last 7 days" window.
+  → GROUP BY item_id + ORDER BY cnt at 12.6 TB scale takes hours, not milliseconds.
+  → This justifies the entire pre-aggregation + streaming pipeline design.
+```
+
+---
+
+### 3.3 Kafka Sizing
+
+**Kafka is the ingest bus. Size it for peak, not average.**
+
+```
+Target: handle 1M events/sec = 64 MB/s.
+
+Partition sizing rule: 1 partition safely handles 10 MB/s (producer + consumer combined).
+  → Producers: write 64 MB/s. Consumers (Flink): read 64 MB/s (per consumer group).
+     Total per partition bandwidth: 64 MB/s producer / (10MB/s per partition) = 7 partitons
+  → With 2 consumer groups (Flink aggregation + S3 archiver):
+     Each partition serves: producer + 2 consumers = 3× traffic.
+     Target per partition: ≤ 10 MB/s each way.
+  → Partitions needed = ceil(64 MB/s / 10 MB/s) = 7 (producer side alone).
+     
+  →   With safety factor 10×: 100 partitions. ✓ (Adequate for 640 KB/s per partition.)
+
+  → 10x safety helps in parallel flink processing, traffic spikes, Broker load balancing, future growth.
+
+  -------------------------------------
+
+Partition key: item_id % 100
+  → All events for the same item go to the same partition.
+  → This is critical: Flink task for partition 37 can maintain local state (count)
+     for all items mapping to partition 37. No cross-task coordination needed.
+  → Risk: hot partitions if a single item has 50% of all events.
+    → Mitigation: if one item dominates (flash sale), sub-partition by user_id suffix.
+
+  How to handle hot partition?
+  That one hot partition becomes the bottleneck for:
+  1. producer writes
+  2. broker disk/network
+  3. consumer reads
+  4. Flink task processing
+
+  solution:-
+  key = item_id + random_shard
+  item123#0
+  item123#1
+  item123#2
+  ...
+  item123#9
+
+  Now one hot item is spread across 10 partitions.
+  Then Flink does:
+    1. local partial counts per salted key
+    2. second-stage aggregation to combine them
+
+
+Topic configuration:
+  Topic name:           event_stream
+  Partitions:           100
+  Replication factor:   3          (tolerate 2 broker failures simultaneously)
+  Retention:            48 hours   (replay replay-buffer for Flink recovery)
+  Compression:          LZ4        (fast compression; 64-byte events may not compress much,
+                                    but batch compression of 1000 events achieves ~40% savings)
+  Segment size:         256 MB     (balance between compaction frequency and seek overhead)
+  Min insync replicas:  2          (producer acks=all; message durable on 2/3 replicas before ack)
+
+Kafka cluster sizing:
+  Write throughput: 64 MB/s (uncompressed) → ~38 MB/s compressed (LZ4 ~40% savings).
+  Per broker: 300 MB/s throughput typical for commodity hardware.
+  Read: 64 MB/s × 2 consumer groups = 128 MB/s.
+  Total per broker throughput: (38 + 128) = 166 MB/s.
+  Brokers needed: ceil(166 / 300) = 1, but with replication writes go to 3 brokers.
+  Practical: 3 brokers minimum (for replication factor 3). Add 2 more for headroom.
+  → 5 Kafka brokers, each with 8 TB SSD (48h × 38 MB/s × 3 replicas = ~20 TB per cluster; 5 brokers × 8 TB = 40 TB — adequate).
+
+Producer acknowledgment latency:
+  acks=1 (leader only): < 5ms.
+  acks=all (min.insync.replicas=2): < 15ms (1 round-trip to 2 brokers).
+  Decision: acks=1 in the event ingestion hot path (slightly lower durability for lower latency).
+            Acceptable: losing < 0.001% of events in a Kafka broker crash is tolerable.
+```
+
+---
+
+### 3.4 Flink Cluster Sizing
+
+**Flink processes the event stream into per-item counts and Top-K updates.**
+
+```
+Two Flink jobs:
+  Job 1: ItemCountAggregator (raw events → 1-min item counts).
+  Job 2: TopKUpdater (1-min counts → sliding window scores → Redis ZADD).
+
+Job 1 — ItemCountAggregator:
+
+  Input: 100 Kafka partitions = 100 Flink tasks (one task per partition).
+  
+  Per task throughput:
+    1M events/sec ÷ 100 partitions = 10,000 events/sec per task.
+    10,000 events × 64 bytes = 640 KB/s per task — trivially light.
+  
+  Per task state (dedup map + window accumulator):
+    Dedup state: last 1 hour of event_ids.
+      Events per task in 1h: 10,000/s × 3600s = 36M events.
+      event_id size: 16 bytes.
+      36M × 16 bytes = 576 MB per task. ← This is large!
+    
+    Optimization: Use Bloom filter for dedup instead of exact HashMap.
+      Bloom filter for 36M events at 1% false positive rate: ~43 MB per task. ✓
+      False positive: 1% of events incorrectly marked as duplicate → tolerable
+      (no double-counting harm from true positives; occasional false negative is minor).
+    
+    Window accumulator state (1-min tumbling window):
+      Active items per partition: 10M total / 100 partitions = 100K items/task.
+      Per item: item_id (16B) + count (4B) + scope (4B) = 24 bytes.
+      100K × 24 bytes = 2.4 MB per task — tiny.
+    
+    Final per-task memory: 43 MB (bloom) + 2.4 MB (window state) ≈ 50 MB.
+
+  Flink task parallelism: 100 (matches Kafka partitions).
+  Memory per TaskManager: 50 MB × num_tasks_per_TM.
+  With 4 tasks per TaskManager: 4 × 50 MB = 200 MB + JVM overhead → 1 GB per TM.
+  Number of TaskManagers: 100 tasks / 4 per TM = 25 TMs.
+  Machines: 5 servers × 5 TMs each (each server: 4 cores, 8 GB RAM).
+
+Job 2 — TopKUpdater:
+
+  Input: item_counts_1m Kafka topic (output of Job 1).
+  Volume: at peak, 1M events aggregate to ≤ 10M distinct items per minute.
+  Per minute: at most 10M records { scope, item_id, count_60s }.
+  Each record: ~50 bytes → 10M × 50 = 500 MB per minute → ~8 MB/s.
+  (This is much lower volume than raw events — Flink job 1 already compressed them.)
+
+  Per task state (circular buffer for sliding windows):
+    For 24h window with 1-min buckets: 1440 buckets per item.
+    Active items per partition: 100K items.
+    Per item: 1440 buckets × 4 bytes (count per bucket) = 5.76 KB.
+    Total per task: 100K items × 5.76 KB = 576 MB.
+    
+    For 3 windows (1h=60 buckets, 24h=1440 buckets, 7d=10080 buckets):
+    Per item: (60 + 1440 + 10080) × 4 bytes = 46,320 bytes ≈ 46 KB.
+    Total per task: 100K × 46 KB = 4.6 GB. ← Large! Need enough RAM.
+    
+    With 100 tasks: 100 × 4.6 GB = 460 GB total state.
+    Checkpointed to S3 every 60s (incremental checkpoint: only changed state written).
+    
+  Machines: 20 servers × 5 TMs each (each server: 8 cores, 32 GB RAM).
+  Total: 100 TMs, each holding ~4.6 GB state + JVM overhead ≈ 8 GB per TM.
+  20 servers × 32 GB = capable of holding 20 × 5 TMs × 8 GB = 800 GB total. ✓
+
+Flink total cluster: ~25 nodes for Job 1 + 20 nodes for Job 2 = 45 nodes.
+In practice: use one Flink cluster with 50 nodes and schedule both jobs.
+```
+
+---
+
+### 3.5 Redis Memory Sizing
+
+**Redis holds three things: item counts, Top-K ZSET lists, and response caches.**
+
+```
+Component 1: Per-Item Score Store (Redis Sorted Sets for all active items)
+
+  Active items: 10 million.
+  Windows tracked: 3 (1h, 24h, 7d).
+  Scopes: global + 100 categories = 101 scopes.
+  
+  BUT: Not every item appears in all scopes. On average, each item is active
+  in 1 global scope + ~3 category scopes = 4 scopes per item.
+  
+  Per ZSET entry size in Redis:
+    Redis Sorted Set internally uses a skiplist + hash table.
+    Per entry: member (item_id string ~16 bytes) + score (float64 = 8 bytes)
+               + skiplist pointers (~3 × 8 bytes) + hash table slot overhead (~8 bytes)
+    Total: ~56 bytes per entry.
+    Add Redis key name overhead (~30 bytes) amortized across entries.
+    Effective: ~60 bytes per (item, scope, window) entry.
+  
+  Total ZSET memory:
+    10M items × 4 scopes × 3 windows × 60 bytes = 7.2 GB.
+    Round up 2× for Redis internal fragmentation (jemalloc overhead): ~15 GB.
+
+Component 2: Top-K Result List (only the K=100 entries per scope per window)
+
+  Scopes: 101 (global + 100 categories). Windows: 3. K: 100.
+  Per entry: ~60 bytes.
+  Total: 101 × 3 × 100 × 60 bytes = 1.8 MB → negligible.
+
+Component 3: Response Cache (serialized JSON for Top-K API responses)
+
+  One cached JSON blob per (scope, window, K):
+  JSON for 100 items (item_id + name + score + rank + rank_change + image_url):
+    Per item JSON: ~300 bytes.
+    Per response: 100 × 300 = 30 KB.
+  Total responses cached: 101 scopes × 3 windows × 30 KB = ~9 MB.
+  TTL: 30 seconds. Tiny footprint.
+
+Component 4: Item Metadata Cache (name, image, price for display enrichment)
+
+  Active items needing metadata: top 10,000 per scope (enriched on Top-K reads).
+  Per item metadata: { name: 50 bytes, image_url: 100 bytes, price: 8 bytes, rating: 4 bytes } = ~200 bytes.
+  10,000 items × 200 bytes = 2 MB. Negligible.
+
+TOTAL Redis Memory:
+  ZSET scores:     15 GB
+  Response cache:   0.01 GB
+  Item metadata:    0.002 GB
+  Overhead buffer:  5 GB
+  TOTAL:           ~20 GB
+
+Redis Cluster Configuration:
+  6 master shards × 1 replica = 12 Redis nodes.
+  Memory per master: 20 GB / 6 = ~3.3 GB data per shard.
+  Use: 8GB RAM Redis nodes (half for data, half for copy-on-write during BGSAVE).
+  Throughput:
+    Reads: 100K reads/sec → with 6 replica nodes: 100K/6 ≈ 17K reads/sec per node. ✓
+    Writes: Flink writes 10M item updates per minute = 167K ZADD/sec peak.
+            With 6 masters: ~28K ZADD/sec per master. ✓ (Redis handles 100K ops/sec per node.)
+```
+
+---
+
+### 3.6 PostgreSQL (Persistent Score Store + Snapshots)
+
+```
+Table: item_minute_counts (source of truth for historical replay and warm-up)
+  Rows: 10M active items × 1440 minutes/day = 14.4 billion rows/day.
+  → This is too large for a general PostgreSQL table! Cannot INSERT 14.4B rows/day.
+
+  Optimization: Only write items whose count changed in the minute window.
+  Typical activity: 1M distinct items active per minute (10% of 10M active catalog).
+  Writes per day: 1M rows/minute × 1440 = 1.44 billion rows/day.
+  Row size: (item_id 16B + scope 8B + window_start 8B + count 4B) = 36 bytes.
+  Storage: 1.44B × 36 bytes ≈ 52 GB/day.
+
+  Retention: 7 days for hot query. Archive to S3 after 7 days.
+  Hot storage: 52 GB × 7 = 364 GB on NVMe-backed PostgreSQL.
+
+Table: rank_snapshots (hourly Top-K snapshots)
+  Snapshots: 24 per day × 101 scopes × 3 windows × 1000 items = 7.27M rows/day.
+  Row size: ~200 bytes.
+  Per day: 7.27M × 200 = ~1.45 GB/day.
+  30-day retention: 43.5 GB → very manageable.
+
+PostgreSQL sizing:
+  2 nodes (primary + replica).
+  Storage: 400 GB NVMe SSD (rank_snapshots + item_minute_counts hot window).
+  RAM: 32 GB (PostgreSQL shared_buffers = 8 GB for hot working set).
+  Write throughput: 1M rows/minute = ~17K rows/sec. PostgreSQL handles up to 50K rows/sec
+  on NVMe with batch inserts. Use COPY or batch INSERT for efficiency.
+```
+
+---
+
+### 3.7 CDN Sizing
+
+```
+CDN serves cached Top-K API responses to geographically distributed users.
+
+Read throughput: 100,000 reads/sec.
+Response size: ~30 KB (Top-100 list with metadata).
+Bandwidth: 100K × 30 KB = 3 GB/s outbound CDN bandwidth.
+  → This is handled by CDN (CloudFront / Fastly): they typically handle Tbps globally.
+
+CDN cache hit rate target: > 99%.
+  Why achievable? Top-K response is the SAME for all users (not personalized).
+  One cache entry serves all 100K reads/sec within its TTL window.
+
+  CDN TTL: 60 seconds (matches freshness SLO).
+  Cache miss rate: 1 miss per 60 seconds per edge PoP.
+  Global PoPs: 100 CloudFront edge locations.
+  Origin QPS: ~100 PoPs × 1 miss/60s = ~2 origin requests/sec globally. → Trivially small.
+
+Origin server sizing (to handle CDN misses):
+  2 requests/sec → 1 application server pod handles this easily.
+  In practice: 5 pods for HA. Each pod: 2 vCPU, 4 GB RAM.
+```
+
+---
+
+### 3.8 Network Bandwidth Summary
+
+```
+Layer                      | Inbound        | Outbound
+─────────────────────────────────────────────────────────
+Ingest API → Kafka         | 64 MB/s peak   | 64 MB/s (fan-out to Flink)
+Kafka → Flink (Job 1)      | 64 MB/s        | ~8 MB/s (aggregated counts)
+Kafka → Flink (Job 2)      | 8 MB/s         | ~1 MB/s (ZADD to Redis)
+Flink → Redis (ZADD)       | —              | 1M items/min × 50 bytes = 833 KB/s
+Redis → API Service        | —              | 100K reads × 30 KB = 3 GB/s (CDN handles)
+CDN → End Users            | —              | 3 GB/s
+
+Internal network peak demand: ~200 MB/s (dominated by Kafka).
+A 10 Gbps internal network has 1,250 MB/s capacity → 6× headroom. ✓
+```
+
+---
+
+### 3.9 End-To-End Latency Budget
+
+```
+Budget: Top-K freshness SLO = events reflected in Top-K within 60 seconds.
+
+Component                          | Latency
+──────────────────────────────────── ──────────
+Purchase service → Kafka publish   | < 15ms (acks=1)
+Kafka → Flink consumption lag      | < 1s (consumer polling interval 100ms + processing)
+Flink 1-min tumbling window        | up to 60s (window closes every 60s)
+Flink → Kafka item_counts_1m       | < 100ms
+Flink Job 2 → Redis ZADD           | < 500ms (batch window close + Redis write)
+Redis → API response (cache miss)  | < 5ms  (ZREVRANGE + enrich)
+CDN cache update                   | < 1s (TTL or push invalidation)
+
+Total worst-case path:
+  15ms + 1s + 60s + 100ms + 500ms + 5ms + 1s ≈ 63s.
+
+Within the 60-second SLO (just barely). To tighten to 30s:
+  → Reduce Flink window to 30s (tumbling window = 30s instead of 60s).
+  → Trade-off: 30s window means 2× more ZADD writes to Redis (2 per minute instead of 1).
+  → At 10M items: 2 × 10M ZADD/min = 333K ZADD/sec — still within Redis capacity.
+```
+
+---
+
+### 3.10 Count-Min Sketch Mode — Sizing (For 500M Item Catalog)
+
+```
+If tracking all 500M items (not just 10M active) with exact Redis ZSET:
+  500M × 60 bytes = 30 GB active per ZSET × 101 scopes × 3 windows = 9 TB.
+  → Infeasible. Switch to Count-Min Sketch.
+
+Count-Min Sketch parameters for 1% error at 99% confidence:
+  d (rows)    = ceil(log(1/δ)) = ceil(log(1/0.01)) = ceil(4.6) = 5 rows.
+  w (columns) = ceil(e/ε) = ceil(2.718/0.01) = 272 columns.
+  Total counters: 5 × 272 = 1,360 int32 counters.
+  Memory: 1,360 × 4 bytes = 5,440 bytes = 5.4 KB per sketch.
+  
+  Per scope per window: one sketch.
+  Scopes: 101. Windows: 3. Total: 303 sketches.
+  Total sketch memory: 303 × 5.4 KB = 1.6 MB. ← For ALL 500M items!
+
+Space-Saving (paired with sketch for candidate enumeration):
+  k = 10,000 slots (200× overkill for K=100 — safety margin).
+  Per slot: (item_id 16B + count 8B + error 8B) = 32 bytes.
+  Per scope per window: 10,000 × 32 = 320 KB.
+  Total: 303 × 320 KB = 97 MB.
+
+Flink job memory for sketch mode:
+  Per task (100 partitions): 1.6 MB / 100 = 16 KB sketch + 97 MB / 100 = 970 KB Space-Saving.
+  Total per Flink task: ~1 MB. Negligible.
+
+Accuracy validation:
+  For Top-100 items from 1B daily events:
+  Top-1 item typically has ≥ 1M events (0.1% of total).
+  Error bound: ε × N = 0.01 × 1B = 10M overcount possible.
+  True count of rank #100 item: if it has < 10M events, it COULD be confused with rank #101.
+  In practice: top-100 items on Amazon Prime Day each have millions of sales.
+  10M error on a 1M-count item is a problem (10× overcount).
+  Solution: reduce ε to 0.001 → w = 2718 counters → 54 KB per sketch. Still tiny.
+  Now error: 0.001 × 1B = 1M overcount. Items with ≥ 10M true count are reliably identifiable.
+```
+
+---
+
+### 3.11 Capacity Summary Table
+
+| Component     | Sizing                                     | Cost-Driver                                   |
+| ------------- | ------------------------------------------ | --------------------------------------------- |
+| Kafka         | 5 brokers, 8 TB SSD each                   | 64 MB/s peak ingest                           |
+| Flink Job 1   | 5 servers (4 core, 8 GB)                   | 100 tasks, bloom filter dedup                 |
+| Flink Job 2   | 20 servers (8 core, 32 GB)                 | 100 tasks, circular buffer state ~4.6 GB/task |
+| Redis Cluster | 12 nodes (6 master + 6 replica), 8 GB each | 15 GB ZSET data                               |
+| PostgreSQL    | 2 nodes (32 GB RAM, 400 GB NVMe)           | 1M writes/min, 7-day hot window               |
+| CDN           | CloudFront (managed)                       | 3 GB/s outbound to users                      |
+| API Service   | 5 pods (2 vCPU, 4 GB each)                 | CDN origin fallback only                      |
 
 ---
 
@@ -1013,12 +1448,12 @@ Decision: Option B for small events; Option C for large quantity events (quantit
 
 ### 13.1 Exact Count vs Approximate Count (Count-Min Sketch)
 
-| Aspect | Exact (Redis ZADD) | Approximate (Sketch) |
-|---|---|---|
-| Accuracy | 100% exact | ~99%+ for top items |
-| Memory | O(N active items) | O(k) regardless of N |
-| Complexity | Simple | Moderate |
-| Top-K boundary error | None | Possible rank swap at boundary |
+| Aspect               | Exact (Redis ZADD) | Approximate (Sketch)           |
+| -------------------- | ------------------ | ------------------------------ |
+| Accuracy             | 100% exact         | ~99%+ for top items            |
+| Memory               | O(N active items)  | O(k) regardless of N           |
+| Complexity           | Simple             | Moderate                       |
+| Top-K boundary error | None               | Possible rank swap at boundary |
 
 **Decision**: Exact for up to 10M active items (Redis 500 MB). Approximate sketch for larger item sets.
 
@@ -1063,15 +1498,15 @@ Decision: Option B for small events; Option C for large quantity events (quantit
 
 ## 15. Possible 45-Minute Interview Narrative
 
-| Time | Focus |
-|---|---|
-| 0–5 min | Scope: window type, exactness, scale (1M events/sec, 500M items) |
-| 5–12 min | Naive SQL approach and why it fails; data structure overview |
+| Time      | Focus                                                                         |
+| --------- | ----------------------------------------------------------------------------- |
+| 0–5 min   | Scope: window type, exactness, scale (1M events/sec, 500M items)              |
+| 5–12 min  | Naive SQL approach and why it fails; data structure overview                  |
 | 12–20 min | Min-Heap, Redis Sorted Set, Count-Min Sketch — full explanation with examples |
-| 20–30 min | Architecture: Kafka → Flink window aggregation → Redis ZADD pipeline |
-| 30–37 min | Sliding window (bucket approach + ZUNIONSTORE), rank changes, caching |
-| 37–43 min | Flash sale burst handling, gaming prevention, failure recovery |
-| 43–45 min | Trade-offs, approximate vs exact, composite scoring extensions |
+| 20–30 min | Architecture: Kafka → Flink window aggregation → Redis ZADD pipeline          |
+| 30–37 min | Sliding window (bucket approach + ZUNIONSTORE), rank changes, caching         |
+| 37–43 min | Flash sale burst handling, gaming prevention, failure recovery                |
+| 43–45 min | Trade-offs, approximate vs exact, composite scoring extensions                |
 
 ---
 
