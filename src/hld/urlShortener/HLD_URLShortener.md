@@ -17,15 +17,15 @@
 - **Duplicate long URLs** — same long URL by same user returns existing short URL.
 
 ### 1.2 Non-Functional Requirements
-| Property | Target |
-|---|---|
-| **Read Latency** | < 10 ms P99 (redirect must be instant) |
-| **Write Latency** | < 100 ms P99 (URL creation) |
-| **Availability** | 99.99% — redirect must always work |
-| **Scale** | 100M URLs created/day; 10B redirects/day |
-| **Read : Write Ratio** | 100 : 1 (extremely read-heavy) |
-| **Uniqueness** | Zero collision on short codes |
-| **Data Retention** | URLs stored for TTL duration; analytics retained 2 years |
+| Property               | Target                                                   |
+| ---------------------- | -------------------------------------------------------- |
+| **Read Latency**       | < 10 ms P99 (redirect must be instant)                   |
+| **Write Latency**      | < 100 ms P99 (URL creation)                              |
+| **Availability**       | 99.99% — redirect must always work                       |
+| **Scale**              | 100M URLs created/day; 10B redirects/day                 |
+| **Read : Write Ratio** | 100 : 1 (extremely read-heavy)                           |
+| **Uniqueness**         | Zero collision on short codes                            |
+| **Data Retention**     | URLs stored for TTL duration; analytics retained 2 years |
 
 ### 1.3 Out of Scope
 - Link preview / metadata scraping
@@ -234,17 +234,46 @@ GET /aB3xYz
 
 1. Check Redis cache: GET url:aB3xYz
    → Cache Hit (90%+): return longUrl immediately (< 1ms)
-   → Cache Miss: query Cassandra
+   → Cache Miss: proceed to step 2
 
-2. On Cassandra hit:
-   → Check is_active = true AND expires_at > now()
-   → Store in Redis (TTL = 24hr or until expires_at)
-   → Publish click event to Kafka (async, non-blocking)
-   → Return HTTP 302 redirect to longUrl
+2. Bloom Filter check (before hitting DB):
+   → If Bloom Filter says DEFINITELY ABSENT → 404 immediately (no DB call)
+   → If Bloom Filter says PROBABLY PRESENT → proceed to step 3
+   (Protects Cassandra from random/invalid code lookups — enumeration attacks)
 
-3. On Cassandra miss:
-   → Bloom filter check: if definitely absent → 404 immediately
-   → Else → 404 Not Found
+3. Query Cassandra:
+   → On hit: check is_active = true AND expires_at > now()
+             Store result in Redis (TTL = 24hr or until expires_at)
+             Publish click event to Kafka (async, non-blocking)
+             Return HTTP 302 redirect to longUrl
+   → On miss: → 404 Not Found (rare — only on Bloom false positive)
+
+Q>> Where should bloom filter live in redis or local in-memory bloom filters?
+
+ Ans>  Two Scenarios
+📍 Scenario A — Bloom Filter in Redis (BF.EXISTS command)
+NO — don't put it before Redis.
+
+You'd be making one Redis call to avoid another Redis call. That's redundant — same network hop, same latency, no benefit.
+
+Redis BF.EXISTS url:aB3xYz   ← Redis call #1
+Redis GET url:aB3xYz         ← Redis call #2  (pointless if #1 is already a Redis call)
+The correct order stays: Redis GET → Bloom Filter (BF.EXISTS) → Cassandra
+
+📍 Scenario B — Bloom Filter is local in-memory (inside the service)
+YES — absolutely put it first, before Redis.
+
+A local Bloom Filter runs in nanoseconds with zero network cost. It kills bad requests before any I/O happens at all.
+
+Local BF check (ns)   ← definitely absent? → 404 immediately, zero network
+Redis GET (~0.5ms)    ← only reached for codes that might exist
+Cassandra (~5-10ms)   ← only reached on Redis miss
+What's Standard in Practice?
+Setup	Bloom Filter Location	Put Before Redis?
+Cassandra (built-in)	Local per SSTable	N/A — Cassandra handles it internally
+Custom service BF	Local in-memory	✅ Yes — put it first
+Redis BF module	Inside Redis	❌ No — would be a redundant Redis call
+
 
 4. HTTP Response:
    → 301 (Permanent) — for public URLs (browser caches; reduces repeat hits)
@@ -252,12 +281,12 @@ GET /aB3xYz
 ```
 
 **301 vs 302 Trade-off:**
-| | 301 Permanent | 302 Temporary |
-|---|---|---|
-| Browser caching | Yes (subsequent visits bypass server) | No |
-| Analytics accuracy | Undercounts repeats | Full click tracking |
-| Server load | Lower | Higher |
-| **Recommendation** | General shortening | Analytics-required URLs |
+|                    | 301 Permanent                         | 302 Temporary           |
+| ------------------ | ------------------------------------- | ----------------------- |
+| Browser caching    | Yes (subsequent visits bypass server) | No                      |
+| Analytics accuracy | Undercounts repeats                   | Full click tracking     |
+| Server load        | Lower                                 | Higher                  |
+| **Recommendation** | General shortening                    | Analytics-required URLs |
 
 ### 6.3 Caching Strategy
 
@@ -296,6 +325,20 @@ Flink Streaming Job
 Cassandra (url_click_events) — raw events
 Cassandra (url_stats) — COUNTER increments
 Redis (real-time counters for dashboard)
+```
+```java
+> total url count:-
+
+stream
+  .keyBy(event -> event.shortCode)
+  .window(TumblingProcessingTimeWindows.of(Time.minutes(1)))
+  .sum("count");
+
+> geo location count:-
+  stream
+  .keyBy(event -> event.country)
+  .window(TumblingProcessingTimeWindows.of(Time.minutes(1)))
+  .sum("count");
 ```
 
 ---
@@ -344,54 +387,54 @@ Browser GET short.ly/05dxYz0
 
 ## 9. Scalability
 
-| Layer | Scaling Strategy |
-|---|---|
-| **Write Service** | Stateless; horizontal scale; each instance has local ID pool |
-| **Redirect Service** | Stateless; horizontal scale; CDN caches popular redirects |
-| **Redis** | Cluster mode (sharded by shortCode); hot URLs distributed |
-| **Cassandra** | Partition key = shortCode; scales linearly with nodes |
-| **Kafka** | Partitioned by shortCode; analytics consumers scale independently |
-| **CDN** | CloudFront / Cloudflare caches 301 redirects at edge — no origin hit |
+| Layer                | Scaling Strategy                                                     |
+| -------------------- | -------------------------------------------------------------------- |
+| **Write Service**    | Stateless; horizontal scale; each instance has local ID pool         |
+| **Redirect Service** | Stateless; horizontal scale; CDN caches popular redirects            |
+| **Redis**            | Cluster mode (sharded by shortCode); hot URLs distributed            |
+| **Cassandra**        | Partition key = shortCode; scales linearly with nodes                |
+| **Kafka**            | Partitioned by shortCode; analytics consumers scale independently    |
+| **CDN**              | CloudFront / Cloudflare caches 301 redirects at edge — no origin hit |
 
 ---
 
 ## 10. Security & Abuse Prevention
 
-| Concern | Mitigation |
-|---|---|
-| **Malicious URL shortening** | Domain blocklist + Google Safe Browsing API check on creation |
-| **Short code enumeration** | Rate limit GET requests per IP; non-sequential codes (shuffle Base62 alphabet) |
-| **Spam links** | Require account creation for high-volume use; CAPTCHA for anonymous |
-| **Phishing via short URL** | Warning interstitial for suspicious domains |
-| **Private URLs** | Optional password-protected short URLs |
+| Concern                      | Mitigation                                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------ |
+| **Malicious URL shortening** | Domain blocklist + Google Safe Browsing API check on creation                  |
+| **Short code enumeration**   | Rate limit GET requests per IP; non-sequential codes (shuffle Base62 alphabet) |
+| **Spam links**               | Require account creation for high-volume use; CAPTCHA for anonymous            |
+| **Phishing via short URL**   | Warning interstitial for suspicious domains                                    |
+| **Private URLs**             | Optional password-protected short URLs                                         |
 
 ---
 
 ## 11. Key Design Decisions & Trade-offs
 
-| Decision | Choice | Trade-off |
-|---|---|---|
-| **ID generation** | Range-based pre-allocation + Base62 | Zero collision, no coordination per write |
-| **DB choice** | Cassandra | Write-optimized, scales to 90TB; no complex queries needed |
-| **Short code length** | 7 chars (62⁷ = 3.5T) | Enough for decades; decode > encode speed |
-| **301 vs 302** | 302 for tracked URLs | Full analytics; slightly more server load |
-| **Cache TTL** | 24 hours (hot URLs) | High cache hit; stale risk on deletion (mitigated by active flag) |
-| **Redirect latency** | Redis first, Cassandra fallback | < 1ms cache hit; 10ms DB fallback |
-| **Bloom filter** | Redis-based Bloom filter | Eliminates DB lookups for invalid codes |
-| **Async analytics** | Kafka + Flink | Redirect not blocked by analytics write |
+| Decision              | Choice                              | Trade-off                                                         |
+| --------------------- | ----------------------------------- | ----------------------------------------------------------------- |
+| **ID generation**     | Range-based pre-allocation + Base62 | Zero collision, no coordination per write                         |
+| **DB choice**         | Cassandra                           | Write-optimized, scales to 90TB; no complex queries needed        |
+| **Short code length** | 7 chars (62⁷ = 3.5T)                | Enough for decades; decode > encode speed                         |
+| **301 vs 302**        | 302 for tracked URLs                | Full analytics; slightly more server load                         |
+| **Cache TTL**         | 24 hours (hot URLs)                 | High cache hit; stale risk on deletion (mitigated by active flag) |
+| **Redirect latency**  | Redis first, Cassandra fallback     | < 1ms cache hit; 10ms DB fallback                                 |
+| **Bloom filter**      | Redis-based Bloom filter            | Eliminates DB lookups for invalid codes                           |
+| **Async analytics**   | Kafka + Flink                       | Redirect not blocked by analytics write                           |
 
 ---
 
 ## 12. Monitoring & Observability
 
-| Signal | Metric / Alert |
-|---|---|
-| **Redirect latency** | P99 < 10ms; alert if > 20ms |
-| **Cache hit rate** | Redis hit rate > 95%; alert if < 90% |
-| **URL creation rate** | Writes/sec; spike = potential abuse |
-| **404 rate** | High 404 = code enumeration attack |
-| **Kafka consumer lag** | Analytics lag; alert if > 1M events behind |
-| **Cassandra read latency** | Alert if P99 > 5ms |
+| Signal                     | Metric / Alert                             |
+| -------------------------- | ------------------------------------------ |
+| **Redirect latency**       | P99 < 10ms; alert if > 20ms                |
+| **Cache hit rate**         | Redis hit rate > 95%; alert if < 90%       |
+| **URL creation rate**      | Writes/sec; spike = potential abuse        |
+| **404 rate**               | High 404 = code enumeration attack         |
+| **Kafka consumer lag**     | Analytics lag; alert if > 1M events behind |
+| **Cassandra read latency** | Alert if P99 > 5ms                         |
 
 ---
 
