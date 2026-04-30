@@ -53,18 +53,18 @@
 
 ### 1.2 Non-Functional Requirements
 
-| Property | Target | Reason |
-|---|---|---|
-| **Seat map load** | < 200 ms P99 | Users expect instant seat visualization |
-| **Seat lock latency** | < 500 ms P99 | Any lag = user anxiety, abandonment |
-| **Payment end-to-end** | < 3 sec P99 | Industry standard; longer = drop-off |
-| **Zero double bookings** | Absolute guarantee | Business correctness — non-negotiable |
-| **Availability (browse)** | 99.99% | Browsing should never go down |
-| **Availability (booking)** | 99.9% | Brief degradation acceptable |
-| **Peak concurrent users** | 10M (flash sale) | Avengers/IPL premiere scale |
-| **Peak booking TPS** | 100K bookings/sec | ~10× above normal peak |
-| **Seat count freshness** | Real-time (< 1 sec staleness) | "50 seats available" must be accurate |
-| **Geo redundancy** | 2 active datacenters | RPO < 1 min, RTO < 5 min |
+| Property                   | Target                        | Reason                                  |
+| -------------------------- | ----------------------------- | --------------------------------------- |
+| **Seat map load**          | < 200 ms P99                  | Users expect instant seat visualization |
+| **Seat lock latency**      | < 500 ms P99                  | Any lag = user anxiety, abandonment     |
+| **Payment end-to-end**     | < 3 sec P99                   | Industry standard; longer = drop-off    |
+| **Zero double bookings**   | Absolute guarantee            | Business correctness — non-negotiable   |
+| **Availability (browse)**  | 99.99%                        | Browsing should never go down           |
+| **Availability (booking)** | 99.9%                         | Brief degradation acceptable            |
+| **Peak concurrent users**  | 10M (flash sale)              | Avengers/IPL premiere scale             |
+| **Peak booking TPS**       | 100K bookings/sec             | ~10× above normal peak                  |
+| **Seat count freshness**   | Real-time (< 1 sec staleness) | "50 seats available" must be accurate   |
+| **Geo redundancy**         | 2 active datacenters          | RPO < 1 min, RTO < 5 min                |
 
 ### 1.3 Out of Scope
 - Movie content streaming / trailers
@@ -654,14 +654,14 @@ PaymentService receives webhook:
 
 #### 5.6.2 Failure Modes & Mitigations
 
-| Failure Scenario | Risk | Mitigation |
-|---|---|---|
-| **Webhook never arrives** | Booking stuck in PAYMENT_INIT | Polling job: check payment status from gateway API every 2 min |
-| **Duplicate webhook** | Double-confirm (charge twice?) | Idempotency key = bookingId; `INSERT ... ON CONFLICT DO NOTHING` |
-| **Webhook arrives after lock expiry** | Seat released, then payment succeeds | Reject confirmation: booking_id.status must be LOCKED at confirm time |
-| **Payment gateway timeout** | Unknown payment state | Async poll gateway; do NOT release seats immediately |
-| **Partial payment (wallet split)** | Complex reconciliation | Store each payment instrument separately; confirm only when total = amount |
-| **Refund failure** | User charged, booking cancelled | Dead letter queue; manual reconciliation with finance team |
+| Failure Scenario                      | Risk                                 | Mitigation                                                                 |
+| ------------------------------------- | ------------------------------------ | -------------------------------------------------------------------------- |
+| **Webhook never arrives**             | Booking stuck in PAYMENT_INIT        | Polling job: check payment status from gateway API every 2 min             |
+| **Duplicate webhook**                 | Double-confirm (charge twice?)       | Idempotency key = bookingId; `INSERT ... ON CONFLICT DO NOTHING`           |
+| **Webhook arrives after lock expiry** | Seat released, then payment succeeds | Reject confirmation: booking_id.status must be LOCKED at confirm time      |
+| **Payment gateway timeout**           | Unknown payment state                | Async poll gateway; do NOT release seats immediately                       |
+| **Partial payment (wallet split)**    | Complex reconciliation               | Store each payment instrument separately; confirm only when total = amount |
+| **Refund failure**                    | User charged, booking cancelled      | Dead letter queue; manual reconciliation with finance team                 |
 
 #### 5.6.3 Lock TTL vs Payment Timeout Alignment
 
@@ -820,13 +820,13 @@ Routing:
 
 ### 6.1 Why PostgreSQL?
 
-| Factor | PostgreSQL | Cassandra | MongoDB |
-|---|---|---|---|
-| **ACID transactions** | ✅ Full ACID | ❌ Eventual | ⚠️ Document-level only |
-| **Complex joins** | ✅ Native SQL | ❌ No joins | ❌ $lookup is expensive |
-| **Financial correctness** | ✅ Serializable isolation | ❌ | ⚠️ |
-| **Relational integrity** | ✅ Foreign keys, constraints | ❌ | ❌ |
-| **Operational maturity** | ✅ Excellent | ✅ Good | ✅ Good |
+| Factor                    | PostgreSQL                  | Cassandra  | MongoDB                |
+| ------------------------- | --------------------------- | ---------- | ---------------------- |
+| **ACID transactions**     | ✅ Full ACID                 | ❌ Eventual | ⚠️ Document-level only  |
+| **Complex joins**         | ✅ Native SQL                | ❌ No joins | ❌ $lookup is expensive |
+| **Financial correctness** | ✅ Serializable isolation    | ❌          | ⚠️                      |
+| **Relational integrity**  | ✅ Foreign keys, constraints | ❌          | ❌                      |
+| **Operational maturity**  | ✅ Excellent                 | ✅ Good     | ✅ Good                 |
 
 **Verdict:** Booking is a financial transaction. Double booking = legal and regulatory liability. PostgreSQL's serializable transaction isolation is the correct choice. At 100K TPS, horizontal sharding (by `show_id`) is needed at scale.
 
@@ -994,17 +994,17 @@ Cross-shard user query:
 
 ### Full Redis Namespace Map
 
-| Key | Type | TTL | Written By | Read By |
-|---|---|---|---|---|
-| `shows:{movieId}:{cityId}:{date}` | LIST of showIds | 2 hr | Content Svc | Content Svc |
-| `show:meta:{showId}` | HASH (static fields) | 2 hr | Content Svc | Content Svc |
-| `seatmap:{showId}` | HASH (seatId → status) | 24 hr | Seat Lock Svc | Seat Map Svc |
-| `avail:{showId}` | STRING (int counter) | None | Seat Lock Svc | Content Svc |
-| `lock:{showId}:{seatId}` | STRING (userId) | 600 sec | Seat Lock Svc | Seat Lock Svc |
-| `movie:{movieId}` | HASH (metadata) | 24 hr | Content Svc | Content Svc |
-| `queue:{showId}` | ZSET (userId → ts) | None | Queue Svc | Queue Svc |
-| `booking_token:{token}` | STRING (userId+showId) | 300 sec | Queue Svc | Booking Svc |
-| `rate:{userId}:{endpoint}` | STRING (INCR counter) | 60 sec | API Gateway | API Gateway |
+| Key                               | Type                   | TTL     | Written By    | Read By       |
+| --------------------------------- | ---------------------- | ------- | ------------- | ------------- |
+| `shows:{movieId}:{cityId}:{date}` | LIST of showIds        | 2 hr    | Content Svc   | Content Svc   |
+| `show:meta:{showId}`              | HASH (static fields)   | 2 hr    | Content Svc   | Content Svc   |
+| `seatmap:{showId}`                | HASH (seatId → status) | 24 hr   | Seat Lock Svc | Seat Map Svc  |
+| `avail:{showId}`                  | STRING (int counter)   | None    | Seat Lock Svc | Content Svc   |
+| `lock:{showId}:{seatId}`          | STRING (userId)        | 600 sec | Seat Lock Svc | Seat Lock Svc |
+| `movie:{movieId}`                 | HASH (metadata)        | 24 hr   | Content Svc   | Content Svc   |
+| `queue:{showId}`                  | ZSET (userId → ts)     | None    | Queue Svc     | Queue Svc     |
+| `booking_token:{token}`           | STRING (userId+showId) | 300 sec | Queue Svc     | Booking Svc   |
+| `rate:{userId}:{endpoint}`        | STRING (INCR counter)  | 60 sec  | API Gateway   | API Gateway   |
 
 ### Cache Invalidation Rules
 
@@ -1085,13 +1085,13 @@ Scale:
 
 ### Why WebSocket over SSE?
 
-| Criterion | WebSocket | SSE |
-|---|---|---|
-| **Direction** | Bidirectional | Server → Client only |
-| **Use case fit** | ✅ Client sends seat selection; server pushes state | ❌ Client can't send data |
-| **Load balancing** | ❌ Sticky sessions needed | ✅ Stateless (HTTP) |
-| **Proxy support** | ⚠️ Some proxies block WS | ✅ Works everywhere |
-| **Browser support** | ✅ All modern browsers | ✅ All modern browsers |
+| Criterion           | WebSocket                                          | SSE                      |
+| ------------------- | -------------------------------------------------- | ------------------------ |
+| **Direction**       | Bidirectional                                      | Server → Client only     |
+| **Use case fit**    | ✅ Client sends seat selection; server pushes state | ❌ Client can't send data |
+| **Load balancing**  | ❌ Sticky sessions needed                           | ✅ Stateless (HTTP)       |
+| **Proxy support**   | ⚠️ Some proxies block WS                            | ✅ Works everywhere       |
+| **Browser support** | ✅ All modern browsers                              | ✅ All modern browsers    |
 
 **Decision:** WebSocket. Seat map interaction is bidirectional — clients signal seat highlights ("I'm looking at A1"), server pushes lock/release updates.
 
@@ -1101,14 +1101,14 @@ Scale:
 
 ### 9.1 Race Conditions Catalog
 
-| Race | Scenario | Impact | Solution |
-|---|---|---|---|
-| **Concurrent lock** | Two users try to lock A1 simultaneously | Double lock → double booking | Redis Lua atomic script |
-| **Lock expiry + payment** | Lock expires at T=10, payment arrives T=10.5 | Confirm on released seat | DB optimistic check: `status='LOCKED' AND locked_by=userId` |
-| **Concurrent cancellation** | User cancels while payment webhook arrives | Status conflict | DB: `UPDATE ... WHERE status='CONFIRMED'` is idempotent |
-| **Webhook duplicate** | Gateway sends webhook twice | Double-confirm | Idempotency table: `INSERT payments ON CONFLICT DO NOTHING` |
-| **Seat availability undercount** | INCR and DECR race on avail:{showId} | Wrong count shown | Redis INCR/DECR are atomic; no race possible |
-| **Split brain Redis** | Network partition creates two Redis primaries | Dual writes to different primaries | Redis Cluster with leader election; reads from primary only for seat lock |
+| Race                             | Scenario                                      | Impact                             | Solution                                                                  |
+| -------------------------------- | --------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------- |
+| **Concurrent lock**              | Two users try to lock A1 simultaneously       | Double lock → double booking       | Redis Lua atomic script                                                   |
+| **Lock expiry + payment**        | Lock expires at T=10, payment arrives T=10.5  | Confirm on released seat           | DB optimistic check: `status='LOCKED' AND locked_by=userId`               |
+| **Concurrent cancellation**      | User cancels while payment webhook arrives    | Status conflict                    | DB: `UPDATE ... WHERE status='CONFIRMED'` is idempotent                   |
+| **Webhook duplicate**            | Gateway sends webhook twice                   | Double-confirm                     | Idempotency table: `INSERT payments ON CONFLICT DO NOTHING`               |
+| **Seat availability undercount** | INCR and DECR race on avail:{showId}          | Wrong count shown                  | Redis INCR/DECR are atomic; no race possible                              |
+| **Split brain Redis**            | Network partition creates two Redis primaries | Dual writes to different primaries | Redis Cluster with leader election; reads from primary only for seat lock |
 
 ### 9.2 Idempotency by Design
 
@@ -1134,16 +1134,16 @@ Cancel:        idempotencyKey = bookingId
 
 ### 10.1 Scaling Each Layer
 
-| Layer | Normal | Peak | Strategy |
-|---|---|---|---|
-| **API Gateway** | 5 nodes | 50 nodes | Stateless; HPA on CPU |
-| **Content Service** | 3 nodes | 30 nodes | Stateless; mostly Redis-served |
-| **Booking Service** | 5 nodes | 100 nodes | Stateless; Kafka async |
-| **Seat Lock Service** | 3 nodes | 20 nodes | Stateless; Redis handles concurrency |
-| **WebSocket Gateway** | 10 nodes (10K conn each) | 100 nodes | Sticky session LB + Redis PubSub |
-| **Redis Cluster** | 6 nodes (3 primary + 3 replica) | 30 nodes | Add shards; auto-rebalance |
-| **PostgreSQL Primary** | 1 instance (r6g.4xlarge) | 1 + 5 read replicas | Writes to primary only; reads to replicas |
-| **Kafka** | 6 brokers | 30 brokers | Add brokers; increase partitions |
+| Layer                  | Normal                          | Peak                | Strategy                                  |
+| ---------------------- | ------------------------------- | ------------------- | ----------------------------------------- |
+| **API Gateway**        | 5 nodes                         | 50 nodes            | Stateless; HPA on CPU                     |
+| **Content Service**    | 3 nodes                         | 30 nodes            | Stateless; mostly Redis-served            |
+| **Booking Service**    | 5 nodes                         | 100 nodes           | Stateless; Kafka async                    |
+| **Seat Lock Service**  | 3 nodes                         | 20 nodes            | Stateless; Redis handles concurrency      |
+| **WebSocket Gateway**  | 10 nodes (10K conn each)        | 100 nodes           | Sticky session LB + Redis PubSub          |
+| **Redis Cluster**      | 6 nodes (3 primary + 3 replica) | 30 nodes            | Add shards; auto-rebalance                |
+| **PostgreSQL Primary** | 1 instance (r6g.4xlarge)        | 1 + 5 read replicas | Writes to primary only; reads to replicas |
+| **Kafka**              | 6 brokers                       | 30 brokers          | Add brokers; increase partitions          |
 
 ### 10.2 Database Scaling Bottleneck
 
@@ -1172,14 +1172,14 @@ Production recommendation: Option A (sharding) + Option C (CQRS for analytics wr
 
 ### 11.1 Failure Modes & Mitigations
 
-| Component | Failure | Impact | Mitigation |
-|---|---|---|---|
-| **Redis primary** | Node crash | Seat locks lost; seatmap unavailable | Redis Cluster auto-failover to replica (< 30 sec) |
-| **Redis cluster** | Full cluster down | Cannot lock/confirm any seats | Fallback: pessimistic DB locks (`SELECT FOR UPDATE`); 10× slower but functional |
-| **PostgreSQL primary** | Crash | Cannot confirm bookings | Auto-failover to standby (Patroni); RPO < 10 sec |
-| **Payment gateway** | Outage | Cannot process payments | Queue payment requests; retry with exponential backoff; show "service temporarily unavailable" |
-| **WebSocket gateway** | Node crash | Active seat map sessions disconnected | Client auto-reconnects (browser WS auto-retry); re-fetches full seatmap on reconnect |
-| **Kafka** | Broker down | Event pipeline delayed | Kafka replication factor 3; producer retries with idempotent producers |
+| Component              | Failure           | Impact                                | Mitigation                                                                                     |
+| ---------------------- | ----------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **Redis primary**      | Node crash        | Seat locks lost; seatmap unavailable  | Redis Cluster auto-failover to replica (< 30 sec)                                              |
+| **Redis cluster**      | Full cluster down | Cannot lock/confirm any seats         | Fallback: pessimistic DB locks (`SELECT FOR UPDATE`); 10× slower but functional                |
+| **PostgreSQL primary** | Crash             | Cannot confirm bookings               | Auto-failover to standby (Patroni); RPO < 10 sec                                               |
+| **Payment gateway**    | Outage            | Cannot process payments               | Queue payment requests; retry with exponential backoff; show "service temporarily unavailable" |
+| **WebSocket gateway**  | Node crash        | Active seat map sessions disconnected | Client auto-reconnects (browser WS auto-retry); re-fetches full seatmap on reconnect           |
+| **Kafka**              | Broker down       | Event pipeline delayed                | Kafka replication factor 3; producer retries with idempotent producers                         |
 
 ### 11.2 Circuit Breaker Pattern
 
@@ -1225,17 +1225,17 @@ Kafka:
 
 ### 12.1 Metrics to Monitor
 
-| Signal | Metric | Alert Threshold |
-|---|---|---|
-| **Seat lock success rate** | `lock_attempts - lock_successes / lock_attempts` | < 70% → high contention |
-| **Lock-to-booking conversion** | `confirmed / locked` per hour | < 40% → users abandoning |
-| **Redis avail counter** | `avail:{showId}` < 10 | "Filling Fast" UI trigger |
-| **Payment success rate** | `payment_success / payment_init` | < 90% → gateway issue |
-| **DB write latency** | `booking_confirm_p99` | > 500 ms → replication lag |
-| **WebSocket connections** | per node | > 12K → scale up |
-| **Queue depth** | `ZCARD queue:{showId}` | > 2M → add queue capacity |
-| **Redis memory** | `used_memory / maxmemory` | > 80% → add nodes |
-| **Kafka consumer lag** | notification-service group | > 100K → scale consumers |
+| Signal                         | Metric                                           | Alert Threshold            |
+| ------------------------------ | ------------------------------------------------ | -------------------------- |
+| **Seat lock success rate**     | `lock_attempts - lock_successes / lock_attempts` | < 70% → high contention    |
+| **Lock-to-booking conversion** | `confirmed / locked` per hour                    | < 40% → users abandoning   |
+| **Redis avail counter**        | `avail:{showId}` < 10                            | "Filling Fast" UI trigger  |
+| **Payment success rate**       | `payment_success / payment_init`                 | < 90% → gateway issue      |
+| **DB write latency**           | `booking_confirm_p99`                            | > 500 ms → replication lag |
+| **WebSocket connections**      | per node                                         | > 12K → scale up           |
+| **Queue depth**                | `ZCARD queue:{showId}`                           | > 2M → add queue capacity  |
+| **Redis memory**               | `used_memory / maxmemory`                        | > 80% → add nodes          |
+| **Kafka consumer lag**         | notification-service group                       | > 100K → scale consumers   |
 
 ### 12.2 Distributed Tracing
 
@@ -1258,30 +1258,30 @@ Trace stored in Jaeger; alert if total booking trace > 500ms P99
 
 ## 13. Security
 
-| Area | Threat | Mitigation |
-|---|---|---|
-| **Seat hoarding** | Bot locks 100 seats, never pays → blocks real users | Rate limit: 5 lock attempts/min per user; max 10 seats per booking; CAPTCHA on flash sale |
-| **Payment tampering** | Client sends `amount=1` for ₹800 ticket | Amount computed server-side, never trusted from client; validate before gateway call |
-| **QR code forgery** | Attacker creates fake QR | AES-256 encrypted payload + server-side signature; validate decrypt on scan |
-| **QR reuse** | Same QR used twice | Mark booking as `USED` on first scan; `UPDATE ... WHERE status='CONFIRMED'` → `USED` |
-| **Webhook spoofing** | Attacker sends fake payment success | HMAC-SHA256 signature validation on every webhook; reject if signature invalid |
-| **SQL injection** | Malicious show_id / seat_id | Parameterized queries everywhere; ORM-enforced |
-| **Brute force booking** | Bypass seat lock with timing attacks | Redis rate limiting per userId + IP; exponential backoff after failures |
+| Area                    | Threat                                              | Mitigation                                                                                |
+| ----------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| **Seat hoarding**       | Bot locks 100 seats, never pays → blocks real users | Rate limit: 5 lock attempts/min per user; max 10 seats per booking; CAPTCHA on flash sale |
+| **Payment tampering**   | Client sends `amount=1` for ₹800 ticket             | Amount computed server-side, never trusted from client; validate before gateway call      |
+| **QR code forgery**     | Attacker creates fake QR                            | AES-256 encrypted payload + server-side signature; validate decrypt on scan               |
+| **QR reuse**            | Same QR used twice                                  | Mark booking as `USED` on first scan; `UPDATE ... WHERE status='CONFIRMED'` → `USED`      |
+| **Webhook spoofing**    | Attacker sends fake payment success                 | HMAC-SHA256 signature validation on every webhook; reject if signature invalid            |
+| **SQL injection**       | Malicious show_id / seat_id                         | Parameterized queries everywhere; ORM-enforced                                            |
+| **Brute force booking** | Bypass seat lock with timing attacks                | Redis rate limiting per userId + IP; exponential backoff after failures                   |
 
 ---
 
 ## 14. Trade-offs & Alternatives
 
-| Decision | Choice Made | Alternative | Why This Choice |
-|---|---|---|---|
-| **Concurrency control** | Redis Lua atomic script | DB `SELECT FOR UPDATE` | Lua: microseconds + no DB connection per lock; `SELECT FOR UPDATE` holds connection, causes pool exhaustion at 100K TPS |
-| **Seat state store** | Redis HASH (primary) + PostgreSQL (truth) | PostgreSQL only | PostgreSQL alone: 10–15ms/query; Redis: < 1ms. At 1M seat map reads/sec, DB cannot serve this |
-| **Lock expiry** | Redis TTL + background reconciler | Explicit TTL field in DB only | Redis TTL auto-expires without polling; background job is belt-and-suspenders |
-| **Queue for flash sale** | Redis ZSET (sorted by timestamp) | SQS / Kafka | ZSET: O(log N) insert; instant position query (`ZRANK`); SQS has no position visibility |
-| **Real-time updates** | WebSocket + Redis PubSub | Polling (5 sec intervals) / SSE | Polling: 1M clients × 1 req/5sec = 200K RPS just for status updates; WS is 0 RPS until change |
-| **Payment model** | Async webhook (Kafka) | Synchronous polling | Webhook: booking API returns immediately, payment confirmed async; polling: holds connection open for 3–30 sec under gateway load |
-| **DB choice** | PostgreSQL | Cassandra | Financial ACID required; Cassandra's eventual consistency risks ghost bookings |
-| **Seat map size** | All active shows in Redis (~200 MB) | DB + fetch per request | Redis: < 1ms HGETALL; DB: 5–15ms per query × 1M req/sec = impossible |
+| Decision                 | Choice Made                               | Alternative                     | Why This Choice                                                                                                                   |
+| ------------------------ | ----------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| **Concurrency control**  | Redis Lua atomic script                   | DB `SELECT FOR UPDATE`          | Lua: microseconds + no DB connection per lock; `SELECT FOR UPDATE` holds connection, causes pool exhaustion at 100K TPS           |
+| **Seat state store**     | Redis HASH (primary) + PostgreSQL (truth) | PostgreSQL only                 | PostgreSQL alone: 10–15ms/query; Redis: < 1ms. At 1M seat map reads/sec, DB cannot serve this                                     |
+| **Lock expiry**          | Redis TTL + background reconciler         | Explicit TTL field in DB only   | Redis TTL auto-expires without polling; background job is belt-and-suspenders                                                     |
+| **Queue for flash sale** | Redis ZSET (sorted by timestamp)          | SQS / Kafka                     | ZSET: O(log N) insert; instant position query (`ZRANK`); SQS has no position visibility                                           |
+| **Real-time updates**    | WebSocket + Redis PubSub                  | Polling (5 sec intervals) / SSE | Polling: 1M clients × 1 req/5sec = 200K RPS just for status updates; WS is 0 RPS until change                                     |
+| **Payment model**        | Async webhook (Kafka)                     | Synchronous polling             | Webhook: booking API returns immediately, payment confirmed async; polling: holds connection open for 3–30 sec under gateway load |
+| **DB choice**            | PostgreSQL                                | Cassandra                       | Financial ACID required; Cassandra's eventual consistency risks ghost bookings                                                    |
+| **Seat map size**        | All active shows in Redis (~200 MB)       | DB + fetch per request          | Redis: < 1ms HGETALL; DB: 5–15ms per query × 1M req/sec = impossible                                                              |
 
 ---
 
